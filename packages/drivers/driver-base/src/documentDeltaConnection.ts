@@ -76,22 +76,26 @@ export class DocumentDeltaConnection
 
 	private trackLatencyTimeout: number | undefined;
 
-	// Listeners only needed while the connection is in progress
-	private readonly connectionListeners: Map<string, (...args: any[]) => void> = new Map();
-	// Listeners used throughout the lifetime of the DocumentDeltaConnection
-	private readonly trackedListeners: Map<string, (...args: any[]) => void> = new Map();
+        // Listeners only needed while the connection is in progress for ops socket
+        private readonly connectionListeners: Map<string, (...args: any[]) => void> = new Map();
+        // Listeners only needed while the connection is in progress for signal socket
+        private readonly signalConnectionListeners: Map<string, (...args: any[]) => void> = new Map();
+        // Listeners used throughout the lifetime of the DocumentDeltaConnection for ops socket
+        private readonly trackedListeners: Map<string, (...args: any[]) => void> = new Map();
+        // Listeners used throughout the lifetime of the DocumentDeltaConnection for signal socket
+        private readonly signalTrackedListeners: Map<string, (...args: any[]) => void> = new Map();
 
 	protected get hasDetails(): boolean {
 		return !!this._details;
 	}
 
-	public get disposed() {
-		assert(
-			this._disposed || this.socket.connected,
-			0x244 /* "Socket is closed, but connection is not!" */,
-		);
-		return this._disposed;
-	}
+        public get disposed() {
+                assert(
+                        this._disposed || this.socket.connected || this.signalSocket.connected,
+                        0x244 /* "Socket is closed, but connection is not!" */,
+                );
+                return this._disposed;
+        }
 
 	/**
 	 * Flag to indicate whether the DocumentDeltaConnection is expected to still be capable of sending messages.
@@ -120,13 +124,14 @@ export class DocumentDeltaConnection
 	 * @param logger - for reporting telemetry events
 	 * @param enableLongPollingDowngrades - allow connection to be downgraded to long-polling on websocket failure
 	 */
-	protected constructor(
-		protected readonly socket: Socket,
-		public documentId: string,
-		logger: ITelemetryLoggerExt,
-		private readonly enableLongPollingDowngrades: boolean = false,
-		protected readonly connectionId?: string,
-	) {
+        protected constructor(
+                protected readonly socket: Socket,
+                public documentId: string,
+                logger: ITelemetryLoggerExt,
+                private readonly enableLongPollingDowngrades: boolean = false,
+                protected readonly connectionId?: string,
+                protected readonly signalSocket: Socket = socket,
+        ) {
 		super((name, error) => {
 			this.addPropsToError(error);
 			logger.sendErrorEvent(
@@ -309,14 +314,15 @@ export class DocumentDeltaConnection
 		return this.details.initialClients;
 	}
 
-	protected emitMessages(type: string, messages: IDocumentMessage[][]) {
-		// Although the implementation here disconnects the socket and does not reuse it, other subclasses
-		// (e.g. OdspDocumentDeltaConnection) may reuse the socket.  In these cases, we need to avoid emitting
-		// on the still-live socket.
-		if (!this.disposed) {
-			this.socket.emit(type, this.clientId, messages);
-		}
-	}
+        protected emitMessages(type: string, messages: IDocumentMessage[][]) {
+                // Although the implementation here disconnects the socket and does not reuse it, other subclasses
+                // (e.g. OdspDocumentDeltaConnection) may reuse the socket.  In these cases, we need to avoid emitting
+                // on the still-live socket.
+                if (!this.disposed) {
+                        const targetSocket = type === "submitSignal" ? this.signalSocket : this.socket;
+                        targetSocket.emit(type, this.clientId, messages);
+                }
+        }
 
 	/**
 	 * Submits a new delta operation to the server
@@ -412,14 +418,17 @@ export class DocumentDeltaConnection
 	 * Disconnect from the websocket.
 	 * @param reason - reason for disconnect
 	 */
-	protected disconnectCore() {
-		this.socket.disconnect();
-	}
+        protected disconnectCore() {
+                this.socket.disconnect();
+                if (this.signalSocket !== this.socket) {
+                        this.signalSocket.disconnect();
+                }
+        }
 
-	protected async initialize(connectMessage: IConnect, timeout: number) {
-		this.socket.on("op", this.earlyOpHandler);
-		this.socket.on("signal", this.earlySignalHandler);
-		this.earlyOpHandlerAttached = true;
+        protected async initialize(connectMessage: IConnect, timeout: number) {
+                this.socket.on("op", this.earlyOpHandler);
+                this.signalSocket.on("signal", this.earlySignalHandler);
+                this.earlyOpHandlerAttached = true;
 
 		// Socket.io's reconnect_attempt event is unreliable, so we track connect_error count instead.
 		let internalSocketConnectionFailureCount: number = 0;
@@ -429,7 +438,7 @@ export class DocumentDeltaConnection
 		const getMaxAllowedInternalSocketConnectionFailures = (): number =>
 			getMaxInternalSocketReconnectionAttempts() + 1;
 
-		this._details = await new Promise<IConnected>((resolve, reject) => {
+                this._details = await new Promise<IConnected>((resolve, reject) => {
 			const failAndCloseSocket = (err: IAnyDriverError) => {
 				try {
 					this.closeSocket(err);
@@ -612,10 +621,66 @@ export class DocumentDeltaConnection
 				failConnection(this.createErrorObject("connect_document_error", error));
 			});
 
-			this.socket.emit("connect_document", connectMessage);
-		});
+                this.socket.emit("connect_document", connectMessage);
+                });
 
-		assert(!this.disposed, 0x246 /* "checking consistency of socket & _disposed flags" */);
+                await new Promise<void>((resolve, reject) => {
+                        const failAndCloseSocket = (err: IAnyDriverError) => {
+                                try {
+                                        this.closeSocket(err);
+                                } catch (failError) {
+                                        const normalizedError = this.addPropsToError(failError);
+                                        this.logger.sendErrorEvent({ eventName: "CloseSocketError" }, normalizedError);
+                                }
+                                reject(err);
+                        };
+
+                        const failConnection = (err: IAnyDriverError) => {
+                                try {
+                                        this.disconnect(err);
+                                } catch (failError) {
+                                        const normalizedError = this.addPropsToError(failError);
+                                        this.logger.sendErrorEvent({ eventName: "FailConnectionError" }, normalizedError);
+                                }
+                                reject(err);
+                        };
+
+                        this.addConnectionListener("connect_error", (error) => {
+                                failAndCloseSocket(this.createErrorObject("connect_error", error));
+                        }, true);
+
+                        this.addConnectionListener("connect_timeout", () => {
+                                failAndCloseSocket(this.createErrorObject("connect_timeout"));
+                        }, true);
+
+                        this.addConnectionListener("connect_document_success", (response: IConnected) => {
+                                if (
+                                        connectMessage.nonce !== undefined &&
+                                        response.nonce !== undefined &&
+                                        response.nonce !== connectMessage.nonce
+                                ) {
+                                        return;
+                                }
+
+                                this.removeConnectionListeners();
+                                resolve();
+                        }, true);
+
+                        this.addConnectionListener("connect_document_error", (error) => {
+                                if (
+                                        connectMessage.nonce !== undefined &&
+                                        error.nonce !== undefined &&
+                                        error.nonce !== connectMessage.nonce
+                                ) {
+                                        return;
+                                }
+                                failConnection(this.createErrorObject("connect_document_error", error));
+                        }, true);
+
+                        this.signalSocket.emit("connect_document", connectMessage);
+                });
+
+                assert(!this.disposed, 0x246 /* "checking consistency of socket & _disposed flags" */);
 	}
 
 	private addPropsToError(errorToBeNormalized: unknown) {
@@ -629,14 +694,15 @@ export class DocumentDeltaConnection
 		return normalizedError;
 	}
 
-	protected getConnectionDetailsProps() {
-		return {
-			disposed: this._disposed,
-			socketConnected: this.socket?.connected,
-			clientId: this._details?.clientId,
-			connectionId: this.connectionId,
-		};
-	}
+        protected getConnectionDetailsProps() {
+                return {
+                        disposed: this._disposed,
+                        socketConnected: this.socket?.connected,
+                        signalSocketConnected: this.signalSocket?.connected,
+                        clientId: this._details?.clientId,
+                        connectionId: this.connectionId,
+                };
+        }
 
 	protected earlyOpHandler = (documentId: string, msgs: ISequencedDocumentMessage[]) => {
 		this.queuedMessages.push(...msgs);
@@ -655,53 +721,75 @@ export class DocumentDeltaConnection
 		this.earlyOpHandlerAttached = false;
 	}
 
-	private removeEarlySignalHandler() {
-		this.socket.removeListener("signal", this.earlySignalHandler);
-	}
+        private removeEarlySignalHandler() {
+                this.signalSocket.removeListener("signal", this.earlySignalHandler);
+        }
 
-	private addConnectionListener(event: string, listener: (...args: any[]) => void) {
-		assert(
-			!DocumentDeltaConnection.eventsAlwaysForwarded.includes(event),
-			0x247 /* "Use addTrackedListener instead" */,
-		);
-		assert(
-			!DocumentDeltaConnection.eventsToForward.includes(event),
-			0x248 /* "should not subscribe to forwarded events" */,
-		);
-		this.socket.on(event, listener);
-		assert(!this.connectionListeners.has(event), 0x20d /* "double connection listener" */);
-		this.connectionListeners.set(event, listener);
-	}
+        private addConnectionListener(event: string, listener: (...args: any[]) => void, useSignalSocket: boolean = false) {
+                assert(
+                        !DocumentDeltaConnection.eventsAlwaysForwarded.includes(event),
+                        0x247 /* "Use addTrackedListener instead" */,
+                );
+                assert(
+                        !DocumentDeltaConnection.eventsToForward.includes(event),
+                        0x248 /* "should not subscribe to forwarded events" */,
+                );
+                const socket = useSignalSocket ? this.signalSocket : this.socket;
+                const map = useSignalSocket ? this.signalConnectionListeners : this.connectionListeners;
+                socket.on(event, listener);
+                assert(!map.has(event), 0x20d /* "double connection listener" */);
+                map.set(event, listener);
+        }
 
-	protected addTrackedListener(event: string, listener: (...args: any[]) => void) {
-		this.socket.on(event, listener);
-		assert(!this.trackedListeners.has(event), 0x20e /* "double tracked listener" */);
-		this.trackedListeners.set(event, listener);
-	}
+        protected addTrackedListener(event: string, listener: (...args: any[]) => void) {
+                if (event === "signal") {
+                        this.signalSocket.on(event, listener);
+                        assert(!this.signalTrackedListeners.has(event), 0x20e /* "double tracked listener" */);
+                        this.signalTrackedListeners.set(event, listener);
+                } else if (DocumentDeltaConnection.eventsAlwaysForwarded.includes(event)) {
+                        this.socket.on(event, listener);
+                        this.signalSocket.on(event, listener);
+                        assert(!this.trackedListeners.has(event), 0x20e /* "double tracked listener" */);
+                        this.trackedListeners.set(event, listener);
+                        this.signalTrackedListeners.set(event, listener);
+                } else {
+                        this.socket.on(event, listener);
+                        assert(!this.trackedListeners.has(event), 0x20e /* "double tracked listener" */);
+                        this.trackedListeners.set(event, listener);
+                }
+        }
 
-	private removeTrackedListeners() {
-		for (const [event, listener] of this.trackedListeners.entries()) {
-			this.socket.off(event, listener);
-		}
-		// removeTrackedListeners removes all listeners, including connection listeners
-		this.removeConnectionListeners();
+        private removeTrackedListeners() {
+                for (const [event, listener] of this.trackedListeners.entries()) {
+                        this.socket.off(event, listener);
+                }
+                for (const [event, listener] of this.signalTrackedListeners.entries()) {
+                        this.signalSocket.off(event, listener);
+                }
+                // removeTrackedListeners removes all listeners, including connection listeners
+                this.removeConnectionListeners();
 
-		this.removeEarlyOpHandler();
-		this.removeEarlySignalHandler();
+                this.removeEarlyOpHandler();
+                this.removeEarlySignalHandler();
 
-		this.trackedListeners.clear();
-	}
+                this.trackedListeners.clear();
+                this.signalTrackedListeners.clear();
+        }
 
-	private removeConnectionListeners() {
-		if (this.socketConnectionTimeout !== undefined) {
-			clearTimeout(this.socketConnectionTimeout);
-		}
+        private removeConnectionListeners() {
+                if (this.socketConnectionTimeout !== undefined) {
+                        clearTimeout(this.socketConnectionTimeout);
+                }
 
-		for (const [event, listener] of this.connectionListeners.entries()) {
-			this.socket.off(event, listener);
-		}
-		this.connectionListeners.clear();
-	}
+                for (const [event, listener] of this.connectionListeners.entries()) {
+                        this.socket.off(event, listener);
+                }
+                this.connectionListeners.clear();
+                for (const [event, listener] of this.signalConnectionListeners.entries()) {
+                        this.signalSocket.off(event, listener);
+                }
+                this.signalConnectionListeners.clear();
+        }
 
 	private getErrorMessage(error?: any): string {
 		if (error?.type !== "TransportError") {
