@@ -735,12 +735,15 @@ export class ConnectionManager implements IConnectionManager {
 		this.connection = undefined;
 
 		// Remove listeners first so we don't try to retrigger this flow accidentally through reconnectOnError
-		connection.off("op", this.opHandler);
-		connection.off("signal", this.signalHandler);
-		connection.off("nack", this.nackHandler);
-		connection.off("disconnect", this.disconnectHandlerInternal);
-		connection.off("error", this.errorHandler);
-		connection.off("pong", this.props.pongHandler);
+                const opSocket: any = (connection as any).socket ?? connection;
+                const signalSocket: any = (connection as any).signalSocket ?? opSocket;
+
+                opSocket.off("op", this.opHandler);
+                signalSocket.off("signal", this.signalHandler);
+                connection.off("nack", this.nackHandler);
+                connection.off("disconnect", this.disconnectHandlerInternal);
+                connection.off("error", this.errorHandler);
+                connection.off("pong", this.props.pongHandler);
 
 		// eslint-disable-next-line @typescript-eslint/no-floating-promises
 		this._outbound.pause();
@@ -831,14 +834,17 @@ export class ConnectionManager implements IConnectionManager {
 			return;
 		}
 
-		this._outbound.resume();
+                this._outbound.resume();
 
-		connection.on("op", this.opHandler);
-		connection.on("signal", this.signalHandler);
-		connection.on("nack", this.nackHandler);
-		connection.on("disconnect", this.disconnectHandlerInternal);
-		connection.on("error", this.errorHandler);
-		connection.on("pong", this.props.pongHandler);
+                const opSocket: any = (connection as any).socket ?? connection;
+                const signalSocket: any = (connection as any).signalSocket ?? opSocket;
+
+                opSocket.on("op", this.opHandler);
+                signalSocket.on("signal", this.signalHandler);
+                connection.on("nack", this.nackHandler);
+                connection.on("disconnect", this.disconnectHandlerInternal);
+                connection.on("error", this.errorHandler);
+                connection.on("pong", this.props.pongHandler);
 
 		// Initial messages are always sorted. However, due to early op handler installed by drivers and appending those
 		// ops to initialMessages, resulting set is no longer sorted, which would result in client hitting storage to

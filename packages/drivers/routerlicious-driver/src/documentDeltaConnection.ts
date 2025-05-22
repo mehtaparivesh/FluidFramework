@@ -28,16 +28,26 @@ export class R11sDocumentDeltaConnection extends DocumentDeltaConnection {
 		timeoutMs = 20000,
 		enableLongPollingDowngrade = true,
 	): Promise<IDocumentDeltaConnection> {
-		const socket = io(url, {
-			query: {
-				documentId: id,
-				tenantId,
-			},
-			reconnection: false,
+                const socket = io(url, {
+                        query: {
+                                documentId: id,
+                                tenantId,
+                        },
+                        reconnection: false,
 			// Default to websocket connection, with long-polling disabled
 			transports: ["websocket"],
 			timeout: timeoutMs,
-		});
+                });
+
+                const signalSocket = io(url, {
+                        query: {
+                                documentId: id,
+                                tenantId,
+                        },
+                        reconnection: false,
+                        transports: ["websocket"],
+                        timeout: timeoutMs,
+                });
 
 		const connectMessage: IConnect = {
 			client,
@@ -51,12 +61,14 @@ export class R11sDocumentDeltaConnection extends DocumentDeltaConnection {
 			),
 		};
 
-		const deltaConnection = new R11sDocumentDeltaConnection(
-			socket,
-			id,
-			logger,
-			enableLongPollingDowngrade,
-		);
+                const deltaConnection = new R11sDocumentDeltaConnection(
+                        socket,
+                        id,
+                        logger,
+                        enableLongPollingDowngrade,
+                        undefined,
+                        signalSocket,
+                );
 
 		await deltaConnection.initialize(connectMessage, timeoutMs);
 		return deltaConnection;
